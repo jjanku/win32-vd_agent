@@ -51,8 +51,22 @@ FileXfer::~FileXfer()
     reset();
 }
 
-void FileXfer::handle_start(VDAgentFileXferStartMessage* start,
-                            VDAgentFileXferStatusMessage* status)
+uint32_t FileXfer::create_status_message(VDAgentFileXferStatusMessage** status,
+                                     uint32_t id, uint32_t xfer_status,
+                                     uint8_t* data, uint32_t data_size)
+{
+    *status = (VDAgentFileXferStatusMessage *) malloc(sizeof(VDAgentFileXferStatusMessage) + data_size);
+    (*status)->id = id;
+    (*status)->result = xfer_status;
+
+    if (data)
+        memcpy((*status)->data, data, data_size);
+
+    return sizeof(VDAgentFileXferStatusMessage) + data_size;
+}
+
+uint32_t FileXfer::handle_start(VDAgentFileXferStartMessage* start,
+                            VDAgentFileXferStatusMessage** status)
 {
     char* file_meta = (char*)start->data;
     TCHAR file_path[MAX_PATH];
@@ -64,31 +78,29 @@ void FileXfer::handle_start(VDAgentFileXferStartMessage* start,
     AsUser as_user;
     int wlen;
 
-    status->id = start->id;
-    status->result = VD_AGENT_FILE_XFER_STATUS_ERROR;
     if (!g_key_get_string(file_meta, "vdagent-file-xfer", "name", file_name, sizeof(file_name)) ||
             !g_key_get_uint64(file_meta, "vdagent-file-xfer", "size", &file_size)) {
         vd_printf("file id %u meta parsing failed", start->id);
-        return;
+        return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
     }
     vd_printf("%u %s (%" PRIu64 ")", start->id, file_name, file_size);
     if (!as_user.begin()) {
         vd_printf("as_user failed");
-        return;
+        return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
     }
-
     if (FAILED(SHGetFolderPath(NULL, CSIDL_DESKTOPDIRECTORY | CSIDL_FLAG_CREATE, NULL,
             SHGFP_TYPE_CURRENT, file_path))) {
         vd_printf("failed getting desktop path");
-        return;
+        return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
     }
     if (!GetDiskFreeSpaceEx(file_path, &free_bytes, NULL, NULL)) {
         vd_printf("failed getting disk free space %lu", GetLastError());
-        return;
+        return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
     }
     if (free_bytes.QuadPart < file_size) {
         vd_printf("insufficient disk space %" PRIu64, free_bytes.QuadPart);
-        return;
+        return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_NOT_ENOUGH_SPACE,
+                                     (uint8_t *)&(free_bytes.QuadPart), sizeof(uint64_t));
     }
 
     wlen = _tcslen(file_path);
@@ -96,7 +108,7 @@ void FileXfer::handle_start(VDAgentFileXferStartMessage* start,
     // (1 char for separator, 1 char for filename and 1 char for NUL terminator)
     if (wlen + 3 >= MAX_PATH) {
         vd_printf("error: file too long %ls\\%s", file_path, file_name);
-        return;
+        return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
     }
 
     file_path[wlen++] = TEXT('\\');
@@ -118,7 +130,7 @@ void FileXfer::handle_start(VDAgentFileXferStartMessage* start,
         }
         if ((MultiByteToWideChar(CP_UTF8, 0, dest_filename, -1, file_path + wlen, MAX_PATH - wlen)) == 0) {
             vd_printf("failed converting file_name:%s to WideChar", dest_filename);
-            return;
+            return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
         }
         handle = CreateFile(file_path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
         if (handle != INVALID_HANDLE_VALUE) {
@@ -129,28 +141,27 @@ void FileXfer::handle_start(VDAgentFileXferStartMessage* start,
         // it's a different error, there's not much we can do.
         if (GetLastError() != ERROR_FILE_EXISTS) {
             vd_printf("Failed creating %ls %lu", file_path, GetLastError());
-            return;
+            return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
         }
     }
 
     if (handle == INVALID_HANDLE_VALUE) {
         vd_printf("Failed creating %ls. More than 63 copies exist?", file_path);
-        return;
+        return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
     }
     task = new FileXferTask(handle, file_size, file_path);
     _tasks[start->id] = task;
-    status->result = VD_AGENT_FILE_XFER_STATUS_CAN_SEND_DATA;
+    return create_status_message(status, start->id, VD_AGENT_FILE_XFER_STATUS_CAN_SEND_DATA, NULL, 0);
 }
 
-bool FileXfer::handle_data(VDAgentFileXferDataMessage* data,
-                           VDAgentFileXferStatusMessage* status)
+uint32_t FileXfer::handle_data(VDAgentFileXferDataMessage* data,
+                           VDAgentFileXferStatusMessage** status)
 {
     FileXferTasks::iterator iter;
     FileXferTask* task = NULL;
     DWORD written;
+    uint32_t status_size = 0;
 
-    status->id = data->id;
-    status->result = VD_AGENT_FILE_XFER_STATUS_ERROR;
     iter = _tasks.find(data->id);
     if (iter == _tasks.end()) {
         vd_printf("file id %u not found", data->id);
@@ -168,22 +179,25 @@ bool FileXfer::handle_data(VDAgentFileXferDataMessage* data,
         goto fin;
     }
     if (task->pos < task->size) {
-        return false;
+        return 0;
     }
     vd_printf("%u completed", iter->first);
-    status->result = VD_AGENT_FILE_XFER_STATUS_SUCCESS;
+    status_size = create_status_message(status, data->id, VD_AGENT_FILE_XFER_STATUS_SUCCESS, NULL, 0);
 
 fin:
     if (task) {
         CloseHandle(task->handle);
-        if (status->result != VD_AGENT_FILE_XFER_STATUS_SUCCESS) {
+        if (status_size > 0 && (*status)->result != VD_AGENT_FILE_XFER_STATUS_SUCCESS) {
             DeleteFile(task->name);
         }
         _tasks.erase(iter);
         delete task;
     }
 
-    return true;
+    if (status_size > 0)
+        return status_size;
+    else
+        return create_status_message(status, data->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
 }
 
 void FileXferTask::cancel()
@@ -213,25 +227,20 @@ void FileXfer::handle_status(VDAgentFileXferStatusMessage* status)
     delete task;
 }
 
-bool FileXfer::dispatch(VDAgentMessage* msg, VDAgentFileXferStatusMessage* status)
+uint32_t FileXfer::dispatch(VDAgentMessage* msg, VDAgentFileXferStatusMessage** status)
 {
-    bool ret = false;
-
     switch (msg->type) {
     case VD_AGENT_FILE_XFER_START:
-        handle_start((VDAgentFileXferStartMessage*)msg->data, status);
-        ret = true;
-        break;
+        return handle_start((VDAgentFileXferStartMessage*)msg->data, status);
     case VD_AGENT_FILE_XFER_DATA:
-        ret = handle_data((VDAgentFileXferDataMessage*)msg->data, status);
-        break;
+        return handle_data((VDAgentFileXferDataMessage*)msg->data, status);
     case VD_AGENT_FILE_XFER_STATUS:
         handle_status((VDAgentFileXferStatusMessage*)msg->data);
-        break;
+        return 0;
     default:
         vd_printf("unsupported message type %u size %u", msg->type, msg->size);
     }
-    return ret;
+    return 0;
 }
 
 //minimal parsers for GKeyFile, supporting only key=value with no spaces.

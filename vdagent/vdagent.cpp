@@ -1305,24 +1305,41 @@ void VDAgent::dispatch_message(VDAgentMessage* msg, uint32_t port)
         res = handle_announce_capabilities((VDAgentAnnounceCapabilities*)msg->data, msg->size);
         break;
     case VD_AGENT_FILE_XFER_START: {
-        VDAgentFileXferStatusMessage status;
+        VDAgentFileXferStatusMessage *status = NULL;
+        uint32_t status_size;
+
         if (_session_is_locked) {
             VDAgentFileXferStartMessage *s = (VDAgentFileXferStartMessage *)msg->data;
-            status.id = s->id;
-            status.result = VD_AGENT_FILE_XFER_STATUS_ERROR;
-            vd_printf("Fail to start file-xfer %u due: Locked session", status.id);
-            write_message(VD_AGENT_FILE_XFER_STATUS, sizeof(status), &status);
-        } else if (_file_xfer.dispatch(msg, &status)) {
-            write_message(VD_AGENT_FILE_XFER_STATUS, sizeof(status), &status);
+            status_size = _file_xfer.create_status_message(&status, s->id, VD_AGENT_FILE_XFER_STATUS_ERROR, NULL, 0);
+            vd_printf("Fail to start file-xfer %u due: Locked session", status->id);
+        } else {
+            status_size = _file_xfer.dispatch(msg, &status);
         }
+        if (status_size) {
+            if (status->result > VD_AGENT_FILE_XFER_STATUS_SUCCESS &&
+                !has_capability(VD_AGENT_CAP_FILE_XFER_DETAILED_ERRORS)) {
+                status->result = VD_AGENT_FILE_XFER_STATUS_ERROR;
+                status_size = sizeof(VDAgentFileXferStatusMessage);
+            }
+            write_message(VD_AGENT_FILE_XFER_STATUS, status_size, status);
+        }
+        free(status);
         break;
     }
     case VD_AGENT_FILE_XFER_STATUS:
     case VD_AGENT_FILE_XFER_DATA: {
-        VDAgentFileXferStatusMessage status;
-        if (_file_xfer.dispatch(msg, &status)) {
-            write_message(VD_AGENT_FILE_XFER_STATUS, sizeof(status), &status);
+        VDAgentFileXferStatusMessage *status = NULL;
+        uint32_t status_size = _file_xfer.dispatch(msg, &status);
+
+        if (status_size) {
+            if (status->result > VD_AGENT_FILE_XFER_STATUS_SUCCESS &&
+                !has_capability(VD_AGENT_CAP_FILE_XFER_DETAILED_ERRORS)) {
+                status->result = VD_AGENT_FILE_XFER_STATUS_ERROR;
+                status_size = sizeof(VDAgentFileXferStatusMessage);
+            }
+            write_message(VD_AGENT_FILE_XFER_STATUS, status_size, status);
         }
+        free(status);
         break;
     }
     case VD_AGENT_CLIENT_DISCONNECTED:

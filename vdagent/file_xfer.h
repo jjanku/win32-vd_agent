@@ -43,12 +43,15 @@ typedef std::map<uint32_t, FileXferTask*> FileXferTasks;
 class FileXfer {
 public:
     ~FileXfer();
-    bool dispatch(VDAgentMessage* msg, VDAgentFileXferStatusMessage* status);
+    uint32_t dispatch(VDAgentMessage* msg, VDAgentFileXferStatusMessage** status);
+    uint32_t create_status_message(VDAgentFileXferStatusMessage** status,
+                                     uint32_t id, uint32_t xfer_status,
+                                     uint8_t* data, uint32_t data_size);
     void reset();
 
 private:
-    void handle_start(VDAgentFileXferStartMessage* start, VDAgentFileXferStatusMessage* status);
-    bool handle_data(VDAgentFileXferDataMessage* data, VDAgentFileXferStatusMessage* status);
+    uint32_t handle_start(VDAgentFileXferStartMessage* start, VDAgentFileXferStatusMessage** status);
+    uint32_t handle_data(VDAgentFileXferDataMessage* data, VDAgentFileXferStatusMessage** status);
     void handle_status(VDAgentFileXferStatusMessage* status);
     bool g_key_get_string(char* data, const char* group, const char* key, char* value,
                                         unsigned vsize);
