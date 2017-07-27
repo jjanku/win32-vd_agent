@@ -28,6 +28,9 @@
 #include <queue>
 #include <set>
 #include <vector>
+#include <dwmapi.h>
+#include <versionhelpers.h>
+#include <windows.h>
 
 #define VD_AGENT_LOG_PATH       TEXT("%svdagent.log")
 #define VD_AGENT_WINCLASS_NAME  TEXT("VDAGENT")
@@ -40,6 +43,9 @@
 #ifndef WM_CLIPBOARDUPDATE
 #define WM_CLIPBOARDUPDATE      0x031D
 #endif
+
+#define EVENT_OBJECT_CLOAKED   0x8017
+#define EVENT_OBJECT_UNCLOAKED 0x8018
 
 //FIXME: extract format/type stuff to win_vdagent_common for use by windows\platform.cpp as well
 typedef struct VDClipboardFormat {
@@ -64,6 +70,7 @@ typedef struct ALIGN_VC VDIChunk {
 #define VD_READ_BUF_SIZE       (sizeof(VDIChunk) + VD_AGENT_MAX_DATA_SIZE)
 
 typedef BOOL (WINAPI *PCLIPBOARD_OP)(HWND);
+typedef HRESULT (WINAPI *DWM_GET_PROC)(HWND hwnd, DWORD, PVOID, DWORD);
 
 class VDAgent {
 public:
@@ -92,6 +99,14 @@ private:
     DWORD get_buttons_change(DWORD last_buttons_state, DWORD new_buttons_state,
                              DWORD mask, DWORD down_flag, DWORD up_flag);
     static HGLOBAL utf8_alloc(LPCSTR data, int size);
+    void send_seamless_mode_list();
+    void set_seamless_mode(uint8_t enabled);
+    void set_seamless_win_params(VDAgentSeamlessModeWindow *win, HWND hwnd);
+    bool is_window_relevant(HWND hwnd);
+    static void CALLBACK wnd_event_proc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd,
+                                        LONG idObject, LONG idChild, DWORD dwEventThread,
+                                        DWORD dwmsEventTime);
+    static BOOL CALLBACK enum_wnd_proc(HWND hwnd, LPARAM lparam);
     static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     static DWORD WINAPI event_thread_proc(LPVOID param);
     static VOID CALLBACK read_completion(DWORD err, DWORD bytes, LPOVERLAPPED overlapped);
@@ -168,6 +183,11 @@ private:
 
     std::set<uint32_t> _grab_types;
 
+    HWINEVENTHOOK _win_change_hooks[3];
+    bool _supports_immersive;
+    HMODULE _dwm_lib;
+    DWM_GET_PROC _dwm_get_wnd_attr;
+
     VDLog* _log;
 };
 
@@ -211,6 +231,8 @@ VDAgent::VDAgent()
     , _logon_desktop (false)
     , _display_setting_initialized (false)
     , _max_clipboard (-1)
+    ,  _dwm_lib (NULL)
+    , _dwm_get_wnd_attr (NULL)
     , _log (NULL)
 {
     TCHAR log_path[MAX_PATH];
@@ -225,6 +247,7 @@ VDAgent::VDAgent()
     ZeroMemory(&_read_overlapped, sizeof(_read_overlapped));
     ZeroMemory(&_write_overlapped, sizeof(_write_overlapped));
     ZeroMemory(_read_buf, sizeof(_read_buf));
+    ZeroMemory(_win_change_hooks, sizeof(_win_change_hooks));
 
     _singleton = this;
 }
@@ -339,6 +362,7 @@ bool VDAgent::run()
     }
     vd_printf("Agent stopped");
     CloseHandle(event_thread);
+    set_seamless_mode(FALSE);
     cleanup();
     return true;
 }
@@ -373,6 +397,7 @@ void VDAgent::handle_control_event()
             _file_xfer.reset();
             set_control_event(CONTROL_CLIPBOARD);
             set_clipboard_owner(owner_none);
+            set_seamless_mode(FALSE);
             break;
         case CONTROL_STOP:
             _running = false;
@@ -833,6 +858,7 @@ bool VDAgent::send_announce_capabilities(bool request)
     VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_SPARSE_MONITORS_CONFIG);
     VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_GUEST_LINEEND_CRLF);
     VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_MAX_CLIPBOARD);
+    VD_AGENT_SET_CAPABILITY(caps->caps, VD_AGENT_CAP_SEAMLESS_MODE);
     vd_printf("Sending capabilities:");
     for (uint32_t i = 0 ; i < caps_size; ++i) {
         vd_printf("%X", caps->caps[i]);
@@ -1292,6 +1318,11 @@ void VDAgent::dispatch_message(VDAgentMessage* msg, uint32_t port)
     case VD_AGENT_MAX_CLIPBOARD:
         res = handle_max_clipboard((VDAgentMaxClipboard*)msg->data, msg->size);
         break;
+    case VD_AGENT_SEAMLESS_MODE: {
+        VDAgentSeamlessMode *seamless_msg = (VDAgentSeamlessMode*)msg->data;
+        set_seamless_mode(seamless_msg->enabled);
+        break;
+    }
     default:
         vd_printf("Unsupported message type %u size %u", msg->type, msg->size);
     }
@@ -1299,6 +1330,178 @@ void VDAgent::dispatch_message(VDAgentMessage* msg, uint32_t port)
         vd_printf("handling message type %u failed: %lu", msg->type, GetLastError());
         _running = false;
     }
+}
+
+void VDAgent::set_seamless_mode(uint8_t enabled)
+{
+    if (enabled) {
+        _supports_immersive = IsWindows8OrGreater();
+        if (IsWindowsVistaOrGreater() && !_dwm_lib) {
+            _dwm_lib = LoadLibrary(L"Dwmapi.dll");
+            if (_dwm_lib) {
+                _dwm_get_wnd_attr = (DWM_GET_PROC)GetProcAddress(_dwm_lib, "DwmGetWindowAttribute");
+                if (!_dwm_get_wnd_attr) {
+                    vd_printf("GetProcAddress for DwmGetWindowAttribute failed with error %lu", GetLastError());
+                }
+            } else {
+                vd_printf("Loading Dwmapi.dll failed with error %lu", GetLastError());
+            }
+        }
+
+        if (!_win_change_hooks[0])
+            _win_change_hooks[0] = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,
+                                                   EVENT_OBJECT_LOCATIONCHANGE,
+                                                   NULL, wnd_event_proc, 0, 0,
+                                                   WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        if (!_win_change_hooks[1])
+            _win_change_hooks[1] = SetWinEventHook(EVENT_OBJECT_CREATE,
+                                                   EVENT_OBJECT_HIDE,
+                                                   NULL, wnd_event_proc, 0, 0,
+                                                   WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        if (!_win_change_hooks[2])
+            _win_change_hooks[2] = SetWinEventHook(EVENT_OBJECT_CLOAKED,
+                                                   EVENT_OBJECT_UNCLOAKED,
+                                                   NULL, wnd_event_proc, 0, 0,
+                                                   WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    } else {
+        UnhookWinEvent(_win_change_hooks[0]);
+        _win_change_hooks[0] = NULL;
+        UnhookWinEvent(_win_change_hooks[1]);
+        _win_change_hooks[1] = NULL;
+        UnhookWinEvent(_win_change_hooks[2]);
+        _win_change_hooks[2] = NULL;
+
+        if (_dwm_lib) {
+            FreeLibrary(_dwm_lib);
+            _dwm_lib = NULL;
+            _dwm_get_wnd_attr = NULL;
+        }
+    }
+}
+
+void CALLBACK VDAgent::wnd_event_proc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd,
+                                      LONG idObject, LONG idChild, DWORD dwEventThread,
+                                      DWORD dwmsEventTime)
+{
+    LONG_PTR style;
+
+    if (idObject != OBJID_WINDOW || hwnd == NULL)
+        return;
+
+    style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    if (style & WS_CHILD)
+        return;
+
+    switch (event) {
+        case EVENT_OBJECT_LOCATIONCHANGE:
+        case EVENT_OBJECT_CREATE:
+        case EVENT_OBJECT_SHOW:
+        case EVENT_OBJECT_UNCLOAKED:
+        case EVENT_OBJECT_DESTROY:
+        case EVENT_OBJECT_HIDE:
+        case EVENT_OBJECT_CLOAKED:
+            _singleton->send_seamless_mode_list();
+            break;
+    }
+}
+
+void VDAgent::send_seamless_mode_list()
+{
+    std::queue<HWND> windows;
+    VDAgentSeamlessModeList *list;
+    uint32_t size;
+
+    if (_supports_immersive) {
+        //TODO: we use for-cycle to avoid getting into infinite cycle, but is it necessary?
+        HWND next = NULL;
+        for (int i = 0; i < 2000; i++) {
+            next = FindWindowEx(NULL, next, NULL, NULL );
+            if (next == NULL)
+                break;
+
+            if (is_window_relevant(next))
+                windows.push(next);
+        }
+    } else {
+        EnumWindows(enum_wnd_proc, reinterpret_cast<LPARAM>(&windows));
+    }
+
+    size = sizeof(VDAgentSeamlessModeList) +
+           windows.size() * sizeof(VDAgentSeamlessModeWindow);
+    list = (VDAgentSeamlessModeList*) malloc(size);
+    list->num_of_windows = 0;
+
+    while (!windows.empty()) {
+        set_seamless_win_params(&(list->windows[list->num_of_windows]), windows.front());
+        windows.pop();
+
+        if (list->windows[list->num_of_windows].w == 0 ||
+            list->windows[list->num_of_windows].h == 0)
+            continue;
+
+        list->num_of_windows++;
+    }
+
+    write_message(VD_AGENT_SEAMLESS_MODE_LIST, size, list);
+    free(list);
+}
+
+void VDAgent::set_seamless_win_params(VDAgentSeamlessModeWindow *win, HWND hwnd)
+{
+    RECT rect;
+    HRESULT res = E_NOTIMPL;
+
+    if (_dwm_get_wnd_attr && _supports_immersive)
+        res = _dwm_get_wnd_attr(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                &rect, sizeof(RECT));
+    if (res != S_OK)
+        GetWindowRect(hwnd, &rect);
+
+    win->w = rect.right - rect.left;
+    win->h = rect.bottom - rect.top;
+    win->x = rect.left;
+    win->y = rect.top;
+}
+
+/* determines whether the window should be shown to user in seamless-mode
+ * TODO: sometimes approves unnecessary window, feel free to improve
+ * TODO: should the system tray be displayed or do we create an universal way
+ *       to launch programs for both Win and Linux? */
+bool VDAgent::is_window_relevant(HWND hwnd)
+{
+    BOOL is_cloaked = FALSE;
+    LONG_PTR style;
+    char window_class[16];
+
+    if (_dwm_get_wnd_attr)
+        _dwm_get_wnd_attr(hwnd, DWMWA_CLOAKED,
+                          &is_cloaked, sizeof(BOOL));
+
+    if (!IsWindowVisible(hwnd) || is_cloaked || IsIconic(hwnd))
+        return false;
+
+    style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    if (!(style & (WS_POPUP | WS_CAPTION)))
+        return false;
+
+    //hide desktop
+    GetClassNameA(hwnd, window_class, sizeof(window_class));
+    if (!strcmp(window_class, "Progman") || !strcmp(window_class, "WorkerW"))
+        return false;
+
+    //hide shadow window beneath context menus
+    if (!strcmp(window_class, "SysShadow"))
+        return false;
+
+    return true;
+}
+
+BOOL CALLBACK VDAgent::enum_wnd_proc(HWND hwnd, LPARAM lparam)
+{
+    std::queue<HWND>* windows = reinterpret_cast<std::queue<HWND>*>(lparam);
+    if (_singleton->is_window_relevant(hwnd))
+        windows->push(hwnd);
+    return TRUE;
 }
 
 VOID VDAgent::read_completion(DWORD err, DWORD bytes, LPOVERLAPPED overlapped)
