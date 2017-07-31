@@ -1363,6 +1363,8 @@ void VDAgent::set_seamless_mode(uint8_t enabled)
                                                    EVENT_OBJECT_UNCLOAKED,
                                                    NULL, wnd_event_proc, 0, 0,
                                                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+        send_seamless_mode_list();
     } else {
         UnhookWinEvent(_win_change_hooks[0]);
         _win_change_hooks[0] = NULL;
@@ -1383,6 +1385,7 @@ void CALLBACK VDAgent::wnd_event_proc(HWINEVENTHOOK hWinEventHook, DWORD event, 
                                       LONG idObject, LONG idChild, DWORD dwEventThread,
                                       DWORD dwmsEventTime)
 {
+    VDAgentSeamlessModeWindow win;
     LONG_PTR style;
 
     if (idObject != OBJID_WINDOW || hwnd == NULL)
@@ -1392,17 +1395,27 @@ void CALLBACK VDAgent::wnd_event_proc(HWINEVENTHOOK hWinEventHook, DWORD event, 
     if (style & WS_CHILD)
         return;
 
+    if (IsIconic(hwnd))
+        event = EVENT_OBJECT_HIDE;
+
     switch (event) {
         case EVENT_OBJECT_LOCATIONCHANGE:
         case EVENT_OBJECT_CREATE:
         case EVENT_OBJECT_SHOW:
         case EVENT_OBJECT_UNCLOAKED:
+            if (!_singleton->is_window_relevant(hwnd))
+                return;
+            _singleton->set_seamless_win_params(&win, hwnd);
+            break;
         case EVENT_OBJECT_DESTROY:
         case EVENT_OBJECT_HIDE:
         case EVENT_OBJECT_CLOAKED:
-            _singleton->send_seamless_mode_list();
+            win.w = 0;
+            win.id = (uint64_t)hwnd;
             break;
     }
+
+    _singleton->write_message(VD_AGENT_SEAMLESS_MODE_CHANGE, sizeof(win), &win);
 }
 
 void VDAgent::send_seamless_mode_list()
@@ -1461,6 +1474,7 @@ void VDAgent::set_seamless_win_params(VDAgentSeamlessModeWindow *win, HWND hwnd)
     win->h = rect.bottom - rect.top;
     win->x = rect.left;
     win->y = rect.top;
+    win->id = (uint64_t)hwnd;
 }
 
 /* determines whether the window should be shown to user in seamless-mode
